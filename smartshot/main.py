@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 from smartshot.watcher import ScreenshotWatcher
 from smartshot.utils import get_default_watch_path
+from smartshot.cli.search import cli as search_cli
 
 # Load environment variables from .env file if it exists
 load_dotenv()
@@ -32,21 +33,37 @@ def signal_handler(sig, frame):
 @click.group()
 def cli():
     """SmartShot - A tool to watch for and organize screenshots."""
+    # Add version info
     pass
+
+@cli.command()
+def version():
+    """Show version information."""
+    from smartshot import __version__
+    click.echo(f"SmartShot v{__version__}")
 
 @cli.command()
 @click.option('--path', '-p', 'watch_path',
               default=None,
               help='Path to watch for screenshots (default: ~/Pictures/Screenshots)')
-def start(watch_path):
+@click.option('--no-ocr', is_flag=True, help='Disable OCR processing')
+@click.option('--no-rename', is_flag=True, help='Disable automatic file renaming')
+@click.option('--no-categorize', is_flag=True, help='Disable automatic categorization')
+@click.option('--db', default='smartshot.db', help='Database file path')
+def start(watch_path, no_ocr, no_rename, no_categorize, db):
     """Start watching for new screenshots."""
     global watcher
     
     # Use provided path or default
     watch_path = Path(watch_path) if watch_path else get_default_watch_path()
     
-    print(f"SmartShot v0.1.0")
+    from smartshot import __version__
+    print(f"SmartShot v{__version__}")
     print(f"Watching directory: {watch_path}")
+    print(f"OCR: {'Disabled' if no_ocr else 'Enabled'}")
+    print(f"Auto-rename: {'Disabled' if no_rename else 'Enabled'}")
+    print(f"Auto-categorize: {'Disabled' if no_categorize else 'Enabled'}")
+    print(f"Database: {db}")
     print("Press Ctrl+C to stop")
     
     # Set up signal handler for clean exit
@@ -54,7 +71,13 @@ def start(watch_path):
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
-        watcher = ScreenshotWatcher(watch_path)
+        watcher = ScreenshotWatcher(
+            watch_path, 
+            enable_ocr=not no_ocr,
+            enable_rename=not no_rename,
+            enable_categorize=not no_categorize,
+            db_path=db
+        )
         watcher.start()
         
         # Keep the main thread alive
@@ -71,6 +94,9 @@ def stop():
     """Stop any running watcher (not implemented in this version)."""
     print("The watcher can be stopped by pressing Ctrl+C when running in the terminal.")
     print("This command is a placeholder for future implementation.")
+
+# Add search commands
+cli.add_command(search_cli, name='search')
 
 if __name__ == '__main__':
     cli()

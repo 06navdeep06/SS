@@ -1,8 +1,8 @@
 """Database models and operations for SmartShot."""
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, ForeignKey, Index
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, ForeignKey, Index, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 import hashlib
 
@@ -22,10 +22,19 @@ class Screenshot(Base):
     ocr_text = Column(Text)
     ocr_confidence = Column(Float)
 
+    # Add indexes for better query performance
+    __table_args__ = (
+        Index('idx_created_at', 'created_at'),
+        Index('idx_category_created', 'category', 'created_at'),
+        Index('idx_app_created', 'app_name', 'created_at'),
+    )
+
 class Database:
     def __init__(self, db_path: str = "smartshot.db"):
         self.engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
         self.Session = sessionmaker(bind=self.engine)
+        self.Screenshot = Screenshot
+        self.func = func
         Base.metadata.create_all(self.engine)
     
     def add_screenshot(self, file_path: str, file_name: str, file_size: int,
@@ -49,19 +58,34 @@ class Database:
             return screenshot
     
     def search_screenshots(self, query: str = None, category: str = None, 
-                         app_name: str = None, limit: int = 50) -> List[Screenshot]:
+                         app_name: str = None, min_date: datetime = None, 
+                         limit: int = 50) -> List[Screenshot]:
         with self.Session() as session:
             q = session.query(Screenshot)
             if query:
-                q = q.filter(Screenshot.ocr_text.contains(query) | 
-                            Screenshot.window_title.contains(query))
+                q = q.filter(
+                    (Screenshot.ocr_text.contains(query)) | 
+                    (Screenshot.window_title.contains(query)) |
+                    (Screenshot.file_name.contains(query))
+                )
             if category:
                 q = q.filter(Screenshot.category == category)
             if app_name:
                 q = q.filter(Screenshot.app_name == app_name)
+            if min_date:
+                q = q.filter(Screenshot.created_at >= min_date)
             return q.order_by(Screenshot.created_at.desc()).limit(limit).all()
+    
+    def get_screenshot_by_hash(self, file_hash: str) -> Optional[Screenshot]:
+        """Check if a screenshot with the given hash already exists."""
+        with self.Session() as session:
+            return session.query(Screenshot).filter(Screenshot.file_hash == file_hash).first()
     
     @staticmethod
     def _calculate_file_hash(file_path: str) -> str:
-        with open(file_path, 'rb') as f:
-            return hashlib.sha256(f.read()).hexdigest()
+        try:
+            with open(file_path, 'rb') as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except (IOError, OSError) as e:
+            print(f"Error calculating hash for {file_path}: {e}")
+            return ""

@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -32,11 +33,12 @@ class ScreenshotHandler(FileSystemEventHandler):
         self.enable_ocr = enable_ocr
         self.enable_rename = enable_rename
         self.enable_categorize = enable_categorize
+        self.processed_files = set()  # Track processed files to avoid duplicates
         self.logger = self._setup_logging()
         
         # Initialize categorizer and database
         self.categorizer = ScreenshotCategorizer()
-        self.db = Database(db_path) if db_path else None
+        self.db = Database(db_path or "smartshot.db")
     
     def _setup_logging(self):
         """Configure logging to file."""
@@ -55,7 +57,19 @@ class ScreenshotHandler(FileSystemEventHandler):
             return
             
         file_path = Path(event.src_path)
-        if file_path.suffix.lower() in ('.png', '.jpg', '.jpeg'):
+        
+        # Check if it's an image file and we haven't processed it yet
+        if (file_path.suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif') and 
+            str(file_path) not in self.processed_files):
+            
+            # Add small delay to ensure file is fully written
+            time.sleep(0.5)
+            
+            # Check if file still exists (might have been moved/deleted)
+            if not file_path.exists():
+                return
+                
+            self.processed_files.add(str(file_path))
             self._process_screenshot(file_path)
     
     def _generate_smart_filename(self, file_path: Path, context: dict, ocr_text: str = None) -> str:
@@ -76,11 +90,19 @@ class ScreenshotHandler(FileSystemEventHandler):
         # Get OCR content if enabled and not already provided
         ocr_content = ""
         if self.enable_ocr and ocr_text is None:
-            ocr_text = extract_text_from_image(file_path)
+            try:
+                ocr_text = extract_text_from_image(file_path)
+            except Exception as e:
+                print(f"OCR failed for {file_path}: {e}")
+                ocr_text = "[OCR failed]"
             
-        if ocr_text and not (isinstance(ocr_text, str) and ocr_text.startswith("[")):
-            ocr_summary = summarize_text(ocr_text)
-            ocr_content = clean_filename(ocr_summary)
+        if ocr_text and isinstance(ocr_text, str) and not ocr_text.startswith("["):
+            try:
+                ocr_summary = summarize_text(ocr_text)
+                ocr_content = clean_filename(ocr_summary)
+            except Exception as e:
+                print(f"Summarization failed: {e}")
+                ocr_content = ""
         
         # Clean window title
         window_title = clean_filename(context.get('title', ''))
@@ -114,12 +136,38 @@ class ScreenshotHandler(FileSystemEventHandler):
     def _process_screenshot(self, file_path: Path):
         """Process a new screenshot file with OCR, context awareness, and categorization."""
         try:
+            # Check if file still exists
+            if not file_path.exists():
+                print(f"File no longer exists: {file_path}")
+                return
+                
             # Get file info
             file_size = file_path.stat().st_size
+            
+            # Skip very small files (likely incomplete)
+            if file_size < 1024:  # Less than 1KB
+                print(f"Skipping small file: {file_path} ({file_size} bytes)")
+                return
+                
             timestamp = datetime.fromtimestamp(file_path.stat().st_mtime)
             
+            # Check for duplicates using file hash
+            try:
+                file_hash = self.db._calculate_file_hash(str(file_path))
+                if file_hash and self.db.get_screenshot_by_hash(file_hash):
+                    print(f"Duplicate file detected, skipping: {file_path}")
+                    return
+            except Exception as e:
+                print(f"Hash calculation failed: {e}")
+                file_hash = ""
+            
             # Get window/app context
-            context = get_active_window_info()
+            try:
+                context = get_active_window_info()
+            except Exception as e:
+                print(f"Context detection failed: {e}")
+                context = {"title": "Unknown", "app": "Unknown"}
+                
             app_name = context.get('app', 'Unknown')
             window_title = context.get('title', 'Unknown')
             
@@ -127,18 +175,26 @@ class ScreenshotHandler(FileSystemEventHandler):
             ocr_text = None
             ocr_confidence = None
             if self.enable_ocr:
-                ocr_text = extract_text_from_image(file_path)
-                if ocr_text and not ocr_text.startswith('['):  # Skip error messages
-                    ocr_confidence = 0.9  # Placeholder confidence value
+                try:
+                    ocr_text = extract_text_from_image(file_path)
+                    if ocr_text and not ocr_text.startswith('['):  # Skip error messages
+                        ocr_confidence = 0.9  # Placeholder confidence value
+                except Exception as e:
+                    print(f"OCR processing failed: {e}")
+                    ocr_text = f"[OCR Error: {str(e)}]"
             
             # Categorize the screenshot
             category = None
             if self.enable_categorize:
-                category, confidence = self.categorizer.categorize(
-                    ocr_text or '',
-                    app_name=app_name,
-                    window_title=window_title
-                )
+                try:
+                    category, confidence = self.categorizer.categorize(
+                        ocr_text or '',
+                        app_name=app_name,
+                        window_title=window_title
+                    )
+                except Exception as e:
+                    print(f"Categorization failed: {e}")
+                    category = "Uncategorized"
             
             # Log the event
             log_message = (
@@ -156,46 +212,64 @@ class ScreenshotHandler(FileSystemEventHandler):
             # Generate new filename if renaming is enabled
             new_path = file_path
             if self.enable_rename:
-                new_name = self._generate_smart_filename(file_path, context, ocr_text)
-                if new_name:
-                    new_path = file_path.with_name(f"{new_name}{file_path.suffix}")
-                    
-                    # Handle name conflicts
-                    counter = 1
-                    original_new_path = new_path
-                    while new_path.exists():
-                        new_path = original_new_path.with_stem(f"{original_new_path.stem}_{counter}")
-                        counter += 1
-                    
-                    # Rename the file
-                    file_path.rename(new_path)
-                    rename_msg = f"Renamed to: {new_path.name}"
-                    self.logger.info(rename_msg)
-                    print(rename_msg)
+                try:
+                    new_name = self._generate_smart_filename(file_path, context, ocr_text)
+                    if new_name and new_name != file_path.stem:
+                        new_path = file_path.with_name(f"{new_name}{file_path.suffix}")
+                        
+                        # Handle name conflicts
+                        counter = 1
+                        original_new_path = new_path
+                        while new_path.exists() and new_path != file_path:
+                            new_path = original_new_path.with_stem(f"{original_new_path.stem}_{counter}")
+                            counter += 1
+                        
+                        # Rename the file if the new name is different
+                        if new_path != file_path:
+                            file_path.rename(new_path)
+                            rename_msg = f"Renamed to: {new_path.name}"
+                            self.logger.info(rename_msg)
+                            print(rename_msg)
+                except Exception as e:
+                    print(f"File renaming failed: {e}")
+                    new_path = file_path
             
             # Categorize and move to category folder if enabled
             if self.enable_categorize and category and category != 'Uncategorized':
-                category_dir = self.watch_path / category
-                category_dir.mkdir(exist_ok=True)
-                
-                target_path = category_dir / new_path.name
-                if target_path != new_path:  # Avoid moving to the same location
-                    shutil.move(str(new_path), str(target_path))
-                    new_path = target_path
-                    print(f"Moved to category: {category}")
+                try:
+                    category_dir = self.watch_path / category
+                    category_dir.mkdir(exist_ok=True)
+                    
+                    target_path = category_dir / new_path.name
+                    if target_path != new_path:  # Avoid moving to the same location
+                        # Handle conflicts in category directory
+                        counter = 1
+                        original_target = target_path
+                        while target_path.exists():
+                            target_path = original_target.with_stem(f"{original_target.stem}_{counter}")
+                            counter += 1
+                            
+                        shutil.move(str(new_path), str(target_path))
+                        new_path = target_path
+                        print(f"Moved to category: {category}")
+                except Exception as e:
+                    print(f"Category organization failed: {e}")
             
             # Store in database if enabled
-            if self.db:
-                self.db.add_screenshot(
-                    file_path=str(new_path),
-                    file_name=new_path.name,
-                    file_size=file_size,
-                    category=category,
-                    app_name=app_name,
-                    window_title=window_title,
-                    ocr_text=ocr_text
-                )
-                print("Saved to database")
+            try:
+                if self.db:
+                    self.db.add_screenshot(
+                        file_path=str(new_path),
+                        file_name=new_path.name,
+                        file_size=file_size,
+                        category=category,
+                        app_name=app_name,
+                        window_title=window_title,
+                        ocr_text=ocr_text
+                    )
+                    print("Saved to database")
+            except Exception as e:
+                print(f"Database save failed: {e}")
             
             print("="*50 + "\n")
             
@@ -205,3 +279,7 @@ class ScreenshotHandler(FileSystemEventHandler):
             print(f"ERROR: {error_msg}")
             import traceback
             traceback.print_exc()
+        finally:
+            # Clean up processed files set to prevent memory leaks
+            if len(self.processed_files) > 1000:
+                self.processed_files.clear()
