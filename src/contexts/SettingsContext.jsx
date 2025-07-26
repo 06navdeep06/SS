@@ -90,4 +90,3 @@ export const SettingsProvider = ({ children }) => {
     </SettingsContext.Provider>
   )
 }
-</SettingsContext.Provider>
